@@ -12,7 +12,7 @@ Endpoints:
   GET  /api/market              Market context
   GET  /api/news/<ticker>       Simulated news
 """
-import os, sys, json, time, hashlib, secrets
+import os, sys, json, time, hashlib, secrets, threading
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -422,6 +422,56 @@ def api_news(ticker):
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "tickers": available_tickers()})
+
+# ── Keep-alive / warmup endpoint ───────────────────────────────────────────────
+@app.route("/api/warmup")
+def api_warmup():
+    """Lightweight ping so uptime monitors can keep Render from sleeping."""
+    return jsonify({"status": "warm", "cached_keys": len(_cache)})
+
+# ── Background cache pre-warmer ────────────────────────────────────────────────
+def _prewarm_cache():
+    """Runs once at startup in a background thread.
+    Pre-computes ensemble forecasts for all tickers so the first real
+    request is instant instead of timing out on Render's free tier."""
+    from models.forecaster import EnsembleForecaster, trading_signal
+    time.sleep(3)  # let Flask finish binding the port first
+    print("[prewarm] Starting background forecast cache warm-up...")
+    tickers = available_tickers()
+    for t in tickers:
+        try:
+            df = load_stock(t, days=504)
+            if df is None:
+                continue
+            ck = f"{t}_ensemble_30_504"
+            if cache_get(ck):
+                print(f"[prewarm] {t} already cached, skipping.")
+                continue
+            print(f"[prewarm] Fitting {t}...", flush=True)
+            ens = EnsembleForecaster(horizon=30)
+            ens.fit(df)
+            pred = ens.predict()
+            pred["date"] = pred["date"].astype(str)
+            records = pred.to_dict(orient="records")
+            from models.forecaster import trading_signal
+            sig = trading_signal(df, pred)
+            result = {
+                "ticker": t, "model": "ensemble", "horizon": 30,
+                "weights": ens.weights, "metrics": ens.metrics_,
+                "forecast": records, "signal": sig,
+                "feature_importance": ens.rf.feature_importance(),
+                "elapsed_s": 0,
+            }
+            cache_set(ck, result)
+            print(f"[prewarm] {t} done ✓")
+        except Exception as e:
+            print(f"[prewarm] {t} FAILED: {e}")
+    print("[prewarm] All tickers warmed up.")
+
+# Start the background thread only when running under gunicorn or directly
+if os.environ.get("WERKZEUG_RUN_MAIN") != "true":  # avoid double-run in debug reloader
+    _t = threading.Thread(target=_prewarm_cache, daemon=True)
+    _t.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
